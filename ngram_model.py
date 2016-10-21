@@ -47,8 +47,11 @@ with status("Reading training data... "):
 
 saver = None
 
+# TODO: output embeddings from network (instead of symbol index)
+# TODO: don't save not important variables
+# TODO: carefully initialize embeddings
+# TODO: generate training graphs
 # TODO: gen mode with bigger batch size
-# TODO: carefully initialize all the variables
 
 gather_check_indicies = False
 class Model:
