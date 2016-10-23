@@ -27,6 +27,69 @@ def read_ptb():
   test_set = read_dataset('test')
   return train_set, test_set
 
+EOS = 0
+GO = 1
+UNK = 2
+_symbol_map_prefix = ['<EOS>', '<GO>', '<UNK>']
+
+def read_nkjp_simple():
+  cache_path = "data-nkjp/cache.npz"
+  try:
+    npzfile = np.load(cache_path)
+    arrays = npzfile['arrays']
+    lengths = npzfile['lengths']
+    symbol_map = npzfile['symbol_map']
+    symbol_count = npzfile['symbol_count']
+  except IOError as e:
+    parser = xml.sax.make_parser()
+    parser.setFeature(xml.sax.handler.feature_namespaces, 0)
+
+    texts = []
+
+    class NkjpHandler( xml.sax.ContentHandler ):
+      def __init__(self):
+        self.current_text = None
+        self.append = False
+      def startElement(self, tag, attributes):
+        if tag == 'div':
+          self.current_text = ''
+        elif tag == 'ab':
+          self.append = True
+      def endElement(self, tag):
+        if tag == 'div':
+          texts.append(self.current_text)
+        elif tag == 'ab':
+          self.append = False
+      def characters(self, content):
+        if self.append:
+          if self.current_text:
+            self.current_text += '\n'
+          self.current_text += content
+
+    handler = NkjpHandler()
+    parser.setContentHandler(handler)
+    for filename in glob('data-nkjp/*/text.xml'):
+      parser.parse(filename)
+    rand = random.Random(1337)
+    random.shuffle(texts, random=lambda: rand.uniform(0,1))
+
+    from collections import Counter, defaultdict
+    symbol_counter = Counter()
+    for text in texts:
+      symbol_counter.update(text)
+    symbol_map = np.array(_symbol_map_prefix + [symbol for symbol, count in symbol_counter.items() if count >= 5])
+    def constant_factory(value):
+      return itertools.repeat(value).next
+    reverse_symbol_map = defaultdict(constant_factory(UNK))
+    for i, symbol in enumerate(symbol_map):
+      reverse_symbol_map[symbol] = i
+
+    lengths = np.array([len(text) for text in texts], dtype=np.int32)
+    arrays = np.array([np.array([reverse_symbol_map[c] for c in text], dtype=np.int32) for text in texts])
+    symbol_count = len(symbol_map)
+    np.savez(cache_path, arrays=arrays, lengths=lengths, symbol_map=symbol_map, symbol_count=symbol_count)
+  return arrays, lengths, symbol_map, symbol_count
+
 def read_nkjp(ngram_length=1):
   cache_path = "data-nkjp/cache-{}-gram.npz".format(ngram_length)
   try:
@@ -72,7 +135,7 @@ def read_nkjp(ngram_length=1):
     symbol_counter = Counter()
     for text in texts:
       symbol_counter.update(text)
-    symbol_map = np.array(['<EOS>', '<GO>', '<UNK>'] + [symbol for symbol, count in symbol_counter.items() if count >= 5])
+    symbol_map = np.array(_symbol_map_prefix + [symbol for symbol, count in symbol_counter.items() if count >= 5])
     def constant_factory(value):
       return itertools.repeat(value).next
     reverse_symbol_map = defaultdict(constant_factory(2))
@@ -81,7 +144,7 @@ def read_nkjp(ngram_length=1):
 
     lengths = np.array([len(text)+2 for text in texts], dtype=np.int32)
 
-    symbol_sequences = [[1] * ngram_length + [reverse_symbol_map[c] for c in text] + [0] for text in texts]
+    symbol_sequences = [[GO] * ngram_length + [reverse_symbol_map[c] for c in text] + [EOS] for text in texts]
     arrays = []
     def ngram_code(symbol_sequence, end_pos, length):
       if length == 1:
