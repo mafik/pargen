@@ -34,9 +34,9 @@ checkpoint_name = makedir("checkpoints/" + args.RUN_NAME) + "/model.ckpt"
 restore = args.restore
 ngram_len = args.ngram_length
 
-train_time = 0 # 300
+train_time = 100
 checkpoint_time = 10 if args.quick else 600
-test = True
+test = False
 gen = False
 checkpoint_entropy = 999999
 
@@ -51,6 +51,14 @@ saver = None
 # TODO: don't save not important variables
 # TODO: carefully initialize embeddings
 # TODO: generate training graphs
+
+'''
+In the current model the network receives embedded vectors for the last k n-grams that end at the current location.
+This is better than giving the last k character embeddings because n-gram vectors will be able to encode information specific to a given suffix (whereas character embeddings encode their global properties).
+
+This approach doesn't exploit the ability of ngrams to predict the next symbol in a sequence.
+Possible modification would be to use ngrams to predict k cantidates for the next character, lookup their embeddings and add them to the network input.
+'''
 # TODO: gen mode with bigger batch size
 
 gather_check_indicies = False
@@ -138,12 +146,12 @@ class Model:
 
         #argmax = [tf.argmax(logit, 1) for logit in logits]
         if mode != 'gen':
-          with tf.name_scope("offset_costs", [self.max_sequence_length] + self.logits + sequence_list):
+          with tf.name_scope("offset_costs"): # , [self.max_sequence_length] + self.logits + sequence_list):
             losses = []
             for i in range(self.max_sequence_length-1):
-              next_labels = tf.split(1, ngram_len, sequence_list[i + 1])
+              next_label = tf.split(1, ngram_len, sequence_list[i + 1])
               for j in range(1): # ngram_len):
-                label = tf.squeeze(next_labels[j], [1])
+                label = tf.squeeze(next_label[j], [1])
                 losses.append(tf.nn.sparse_softmax_cross_entropy_with_logits(self.logits[i], label))
 
             offset_costs = [tf.reduce_sum(loss) for loss in losses]
@@ -190,14 +198,14 @@ class Model:
     last_checkpoint = clock()
     training_started = clock()
     while clock() - training_started < train_time:
-      t = clock() - training_started
       #session.run(tf.assign(self.lr, 1 * (.8 ** (t / 10))))
       summaries, train_op = session.run([self.summaries, self.train_op], {})
+      t = clock() - training_started
       train_writer.add_summary(summaries, i)
       train_writer.flush()
       log("Training iteration {}, training time {:.0f}s", i, t)
       i += 1
-      if clock() - last_checkpoint > checkpoint_time:
+      if test and (clock() - last_checkpoint > checkpoint_time):
         validation_entropy = test_model.test(valid_set, False)
 
         log("Current per-character entropy = {:.3f}".format(validation_entropy))
@@ -352,7 +360,7 @@ with g.as_default():
   if gen:
     gen_model = Model('gen')
 
-  with tf.Session(config=tf.ConfigProto(log_device_placement=True)) as session:
+  with tf.Session(config=tf.ConfigProto(log_device_placement=False)) as session:
     test_result_list = []
 
     for loop in range(1):

@@ -3,7 +3,7 @@ from time import clock
 from datetime import timedelta
 import numpy as np
 import contextlib
-import os
+import os, re
 
 def write(s):
   sys.stdout.write("\r" + ' ' * 80)
@@ -48,3 +48,14 @@ def makedir(path):
   if not os.path.exists(path):
     os.makedirs(path)
   return path
+
+def atoi(text):
+    return int(text) if text.isdigit() else text
+
+def natural_keys(text):
+    '''
+    alist.sort(key=natural_keys) sorts in human order
+    http://nedbatchelder.com/blog/200712/human_sorting.html
+    (See Toothy's implementation in the comments)
+    '''
+    return [ atoi(c) for c in re.split('(\d+)', text) ]
