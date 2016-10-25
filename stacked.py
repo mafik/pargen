@@ -57,7 +57,6 @@ check_indices = True
 unrolled_iterations = 5
 network_size = 200
 layer_count = 2
-embedding_size = network_size
 
 concatenated_arrays = np.concatenate([np.concatenate(([data.GO], arr, [data.EOS])) for arr in arrays])
 
@@ -72,7 +71,14 @@ sequence_lengths = tf.Variable([l+2 for l in lengths], trainable=False, name="se
 # [num_sequences] : int32
 sequence_offsets = tf.cumsum(sequence_lengths, exclusive=True, name="sequence_offsets")
 
-embedding_matrix = tf.Variable(tf.random_normal([symbol_count, embedding_size]), name='embedding_matrix')
+
+# [batch_size, network_size] : float32
+initial_zero_state = tf.zeros([batch_size, network_size], name="initial_zero_state")
+
+# tuple2(tuple2([batch_size, network_size])) : float32
+network_state = tuple(
+    LSTMStateTuple(*[tf.Variable(initial_zero_state, trainable=False, name="network_state_{}_{}".format(part, layer))
+                     for part in "ch"]) for layer in range(layer_count))
 
 with tf.name_scope('training'):
   global_step = tf.Variable(1, dtype=tf.int32, name='global_step')
@@ -117,29 +123,43 @@ with tf.name_scope('training'):
   sequence = tf.gather(dataset, indices_to_gather, check_indices, name="sequence")
 
   # [batch_size] : int32
-  consumed_sequence_lengths = tf.minimum(remaining_batch_lengths, unrolled_iterations)
+  # NOTE: batch_max_range is used instead of remaining_batch_lengths to prevent passing of the final EOS as the input
+  consumed_sequence_lengths = tf.minimum(batch_max_range, unrolled_iterations, name="consumed_sequence_lengths")
 
-  # [batch_size, network_size] : float32
-  initial_zero_state = tf.zeros([batch_size, network_size], name="initial_zero_state")
+  # [batch_size] : int32
+  final_batch_progress = tf.add(batch_progress, consumed_sequence_lengths, name="final_batch_progress")
 
-  # tuple2(tuple2([batch_size, network_size])) : float32
-  network_state = tuple(LSTMStateTuple(*[tf.Variable(initial_zero_state, trainable=False, name="network_state_{}_{}".format(part, layer)) for part in "ch"]) for layer in range(layer_count))
+  # [batch_size] : bool
+  finished_batch_mask = tf.greater_equal(consumed_sequence_lengths, batch_max_range, name="finished_batch_mask")
+  #tf.greater_equal(final_batch_progress, batch_lengths, name="finished_batch_mask")
+
+  advance_batch_indices_op = tf.assign(batch_indices, tf.select(finished_batch_mask, random_batch_indices, batch_indices), name="advance_batch_indices_op")
+  advance_batch_progress_op = tf.assign(batch_progress, tf.select(finished_batch_mask, zero_batch, final_batch_progress), name="advance_batch_progress_op")
+  advance_batch_op = tf.group(advance_batch_indices_op, advance_batch_progress_op, name="advance_batch_op")
 
 cell = LSTMCell(network_size, use_peepholes=True, cell_clip=10, state_is_tuple=True)
 cell = DropoutWrapper(cell, output_keep_prob=.5)
 cell = MultiRNNCell([cell] * layer_count, state_is_tuple=True)
-#cell = InputProjectionWrapper(cell, num_proj=network_size)
+cell = InputProjectionWrapper(cell, num_proj=network_size) # TODO: initialize this properly
 cell = OutputProjectionWrapper(cell, output_size=symbol_count)
 
 input_sequence = tf.slice(sequence, [0, 0], [batch_size, unrolled_iterations])
 
-# [batch_size, unrolled_iterations, embedding_size]
-embeddings = tf.nn.embedding_lookup(embedding_matrix, input_sequence)
+# [batch_size, unrolled_iterations, symbol_count]
+input_vector = tf.one_hot(input_sequence, symbol_count)
 
-outputs, state = tf.nn.dynamic_rnn(cell, embeddings,
+outputs, state = tf.nn.dynamic_rnn(cell, input_vector,
                                    sequence_length=consumed_sequence_lengths,
                                    initial_state=network_state,
                                    parallel_iterations=batch_size)
+
+with tf.name_scope('training'):
+  copy_network_state_ops = []
+  for layer_var, layer_new in zip(network_state, state):
+    for state_part_var, state_part_new in zip(layer_var, layer_new):
+      op = tf.assign(state_part_var, tf.select(finished_batch_mask, initial_zero_state, state_part_var))
+      copy_network_state_ops.append(op)
+  copy_network_state_op = tf.group(*copy_network_state_ops, name="copy_network_state_op")
 
 expected_sequence = tf.slice(sequence, [0, 1], [batch_size, unrolled_iterations])
 
@@ -156,7 +176,7 @@ global_norm = tf.global_norm([gv[0] for gv in gradients_with_vars])
 apply_gradients = optimizer.apply_gradients(gradients_with_vars, global_step=global_step)
 
 init_op = tf.initialize_all_variables()
-train_op = tf.group(apply_gradients)
+train_op = tf.group(apply_gradients, advance_batch_op, copy_network_state_op)
 
 summary_list = []
 
@@ -189,21 +209,22 @@ with tf.Session() as session:
   print(session.run(indices_to_gather))
 '''
   def dump():
-    print("Trainable variables:")
-    for v in tf.trainable_variables():
-      print(v.name, v.get_shape())
-    print("Sequence:")
-    seq = session.run(sequence)
-    for row in seq:
-      print(row, ''.join(symbol_map[c] for c in row))
-    print("Losses:")
-    print(session.run(losses))
-    print("Average loss:")
-    print(session.run(average_loss))
-  dump()
+    #print("Trainable variables:")
+    #for v in tf.trainable_variables():
+    #  print(v.name, v.get_shape())
+    #print("Sequence:")
+    seq, progress, lengths, losses_arr, consumed = session.run([sequence, batch_progress, batch_lengths, losses, consumed_sequence_lengths])
+    #print("Average loss:")
+    #print(session.run(average_loss))
+    for row, prog, leng, loss, cons in zip(seq, progress, lengths, losses_arr, consumed):
+      if prog + 5 >= leng:
+        print(row, ''.join(symbol_map[c] for c in row), str(prog) + '/' + str(leng), cons)
+        print("Losses: ", loss)
+
+  #dump()
   print('####TRAINING#####')
-  for i in range(200):
+  for i in range(90):
     summ, step, _ = session.run([summaries, global_step, train_op])
     summary_writer.add_summary(summ, step)
     summary_writer.flush()
-  dump()
+    dump()
