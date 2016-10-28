@@ -2,62 +2,97 @@
 from glob import glob
 from collections import defaultdict
 from tensorflow.python.summary.event_accumulator import EventAccumulator
-import math, argparse, re
+import math, argparse, re, os, pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from utils import *
 
 parser = argparse.ArgumentParser(description='Average plotter')
-parser.add_argument("ATTRIBUTE", type=str, default = 'average_loss')
 args = parser.parse_args()
 
+buckets = 500
 
-time = []
-for i in range(500):
-  time.append(defaultdict(list))
+run_logs = defaultdict(list)
 
-for path in glob('summaries/*/*'):
+for path in glob('summaries/*/*.box'):
+  pickle_path = os.path.splitext(path)[0] + '.pickle'
+  if (not os.path.exists(pickle_path)) or (os.path.getmtime(path) >= os.path.getmtime(pickle_path)):
+    print("Reading events from", path)
+    histogram = tuple([] for i in range(buckets))
+    event_accumulator = EventAccumulator(path)
+    event_accumulator.Reload()
+    tags = event_accumulator.Tags()['scalars']
+    run_log = dict()
+    for tag in tags:
+      scalars = event_accumulator.Scalars(tag)
+      tag_values = map(lambda e: e.value, scalars)
+      histogram = tuple([] for i in range(buckets))
+      tag_value_count = len(tag_values) - 1
+      for i, cost in enumerate(tag_values[:-1]):
+        min_bucket = int(math.floor(float(i) / tag_value_count * buckets))
+        max_bucket = int(math.floor(float(i + 1) / tag_value_count * buckets))
+        max_bucket = max(min_bucket + 1, max_bucket) # at least one index
+        next_tag_value = tag_values[i + 1]
+        bucket_span = max_bucket - min_bucket - 1
+        for ti in range(min_bucket, max_bucket):
+          if bucket_span:
+            alpha = (ti - min_bucket) / float(bucket_span)
+          else:
+            alpha = 1
+          histogram[ti].append((1-alpha) * cost + alpha * next_tag_value)
+      min_step = min(e.step for e in scalars)
+      max_step = max(e.step for e in scalars)
+      run_log[tag] = (histogram, min_step, max_step)
+    pickle.dump(run_log, open(pickle_path, 'w'))
+  else:
+    run_log = pickle.load(open(pickle_path))
+
   type = path.split('/')[1]
-  event_accumulator = EventAccumulator(path)
-  event_accumulator.Reload()
-  costs = map(lambda e: e.value, event_accumulator.Scalars(args.ATTRIBUTE))
-  len_costs = len(costs) - 1
-  for i, cost in enumerate(costs[:-1]):
-    min_time = int(math.floor(float(i) / len_costs * len(time)))
-    max_time = int(math.floor(float(i+1) / len_costs * len(time)))
-    max_time = max(min_time + 1, max_time) # at least one index
-    next_cost = costs[i+1]
-    time_span = max_time - min_time - 1
-    for ti in range(min_time, max_time):
-      if time_span:
-        alpha = (ti - min_time) / float(time_span)
-      else:
-        alpha = 1
-      time[ti][type].append((1-alpha) * cost + alpha * next_cost)
+  run_logs[type].append(run_log)
 
-x = list(range(len(time)))
+x = list(range(buckets))
 median = defaultdict(list)
 low = defaultdict(list)
 high = defaultdict(list)
 
 keys = set()
 
-for step in time:
+for type, run_log_list in run_logs:
+
   for key, values in sorted(step.items()):
     keys.add(key)
-    low[key].append(np.percentile(values, 25))
-    median[key].append(np.median(values))
-    high[key].append(np.percentile(values, 75))
+    if values:
+      low[key].append(np.percentile(values, 50 - 34))
+      median[key].append(np.median(values))
+      high[key].append(np.percentile(values, 50 + 34))
+
+def smooth(series_dict):
+  for key, l1 in series_dict.items():
+    l2 = list(l1)
+    for i in range(1, len(l1)-1):
+      l2[i] = l1[i-1] * 0.25 + l1[i] * 0.5 + l1[i+1] * 0.25
+    series_dict[key] = l2
+
+smooth(low)
+smooth(high)
 
 keys = list(sorted(keys, key=natural_keys))
 
+colors = 'red blue green brown black cyan magenta yellow'.split()
 plt.rc('font', family='Droid Serif', weight='light')
 plt.grid()
-for key in keys:
-  plt.fill_between(x, low[key], high[key], alpha=.3, linewidth=0, label=key)
+for key, color in zip(keys, colors):
+  plt.fill_between(x[:len(low[key])], low[key], high[key], alpha=.3, linewidth=0, color=color)
 
-for key in keys:
-  plt.plot(x, median[key], label=key)
+ceiling_tracker = []
+for key, color in zip(keys, colors):
+  ceiling_tracker.extend(median[key])
+  plt.plot(x[:len(median[key])], median[key], label=key, color=color)
+
+import math
+
+axes = plt.gca()
+axes.set_ylim([math.floor(np.min(ceiling_tracker) * 2) / 2, np.percentile(ceiling_tracker, 99.8)])
 
 plt.legend(loc='upper right', fancybox=True, shadow=True)
 
