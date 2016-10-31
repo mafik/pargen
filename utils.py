@@ -35,7 +35,9 @@ def log_start():
   start_time = clock()
 
 def log(format_string, *args, **kwargs):
-  write(("{}: " + format_string).format(timedelta(seconds=clock() - start_time), *args, **kwargs))
+  t = clock()
+  write(("{}: " + format_string).format(timedelta(seconds=t - start_time), *args, **kwargs))
+  return t
 
 @contextlib.contextmanager
 def status(text):
