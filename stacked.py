@@ -127,18 +127,15 @@ with status("Loading n-gram model..."):
 
     np.savez(ngram_db_path, ngram_dataset=ngram_dataset, ngram_probability_table=ngram_probability_table)
 
-# TODO: retrain ngrams on the test set
-# TODO: use more lengths of n-grams
-
 def translate1(array):
   return ''.join(symbol_map[i] for i in array)
 
 def translate2(array):
   return '\n'.join(translate1(row) for row in array)
 
-batch_size = 400
+batch_size = 40#0
 check_indices = True
-unrolled_iterations = 300
+unrolled_iterations = 30#0
 network_size = 200
 layer_count = 2
 ngram_count = len(ngram_probability_table)
@@ -169,20 +166,20 @@ def make_cell(dropout):
   cell = OutputProjectionWrapper(cell, output_size=symbol_count)
   return cell
 
-def build_input_vector(input_sequence, ngram_index_sequence, ngram_sequence):
+def build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions):
   input_list = []
   input_list.append(tf.one_hot(input_sequence, symbol_count))
   if args.bootstrap_in:
-    mean, variance = tf.nn.moments(ngram_sequence, [2], keep_dims=True)
-    input_list.append(tf.nn.batch_normalization(ngram_sequence, mean, variance, 0, 1, 0.00001))
+    mean, variance = tf.nn.moments(ngram_predictions, [2], keep_dims=True)
+    input_list.append(tf.nn.batch_normalization(ngram_predictions, mean, variance, 0, 1, 0.00001))
   if args.bootstrap_mem:
-    input_list.append(tf.gather(ngram_embeddings, ngram_index_sequence))
+    input_list.append(tf.gather(ngram_embeddings, tf.squeeze(tf.slice(ngram_input_sequence, [0,0,3], [-1,-1,1]))))
   return input_list[0] if len(input_list) == 1 else tf.concat(2, input_list)
 
 
-def get_loss(input_sequence, ngram_sequence, outputs, expected_sequence, consumed_sequence_lengths):
+def get_loss(input_sequence, ngram_predictions, outputs, expected_sequence, consumed_sequence_lengths):
   if args.bootstrap_out:
-    outputs = tf.add(outputs, tf.log(ngram_sequence))
+    outputs = tf.add(outputs, tf.log(ngram_predictions))
   # [batch_size, unrolled_iterations]
   losses = tf.nn.sparse_softmax_cross_entropy_with_logits(outputs, expected_sequence)
   losses = tf.select(tf.equal(input_sequence, data.EOS), tf.zeros_like(losses), losses)
@@ -201,9 +198,9 @@ def build_batch(indices, length, progress=None):
   indices_to_gather = tf.add(tf.tile(tf.expand_dims(current_offsets, 1), [1, length + 1]),
                              range_matrix, name='indices_to_gather')
   sequence = tf.gather(dataset, indices_to_gather, check_indices, name="sequence")
-  ngram_index_sequence = tf.gather(ngram_dataset, tf.slice(indices_to_gather, [0, 0], [-1, length]),
-                                   check_indices, name="ngram_index_sequence")
-  ngram_sequence = tf.gather(ngram_probability_table, ngram_index_sequence, check_indices)
+  ngram_input_sequence = tf.gather(ngram_dataset, tf.slice(indices_to_gather, [0, 0], [-1, length]),
+                                   check_indices, name="ngram_input_sequence")
+  ngram_predictions = tf.gather(ngram_probability_table, tf.squeeze(tf.slice(ngram_input_sequence, [0, 0, 3], [-1, -1, 1]), [2]), check_indices)
   # [batch_size] : int32
   # NOTE: batch_max_range is used instead of remaining_batch_lengths to prevent passing of the final EOS as the input
   consumed_sequence_lengths = tf.minimum(max_range, length, name="consumed_sequence_lengths")
@@ -211,7 +208,7 @@ def build_batch(indices, length, progress=None):
   finished_batch_mask = tf.greater_equal(consumed_sequence_lengths, max_range, name="finished_batch_mask")
   input_sequence = tf.slice(sequence, [0, 0], [-1, length])
   expected_sequence = tf.slice(sequence, [0, 1], [-1, length])
-  return input_sequence, expected_sequence, ngram_index_sequence, ngram_sequence, consumed_sequence_lengths, finished_batch_mask
+  return input_sequence, expected_sequence, ngram_input_sequence, ngram_predictions, consumed_sequence_lengths, finished_batch_mask
 
 def make_state_tuple(zero_state, variable):
   if variable:
@@ -243,11 +240,11 @@ class Train:
     # [batch_size] : int32
     batch_progress = tf.Variable(zero_batch, trainable=False, name="batch_progress")
 
-    input_sequence, expected_sequence, ngram_index_sequence, ngram_sequence_list, consumed_sequence_lengths, finished_batch_mask =\
+    input_sequence, expected_sequence, ngram_input_sequence, ngram_predictions, consumed_sequence_lengths, finished_batch_mask =\
       build_batch(batch_indices, unrolled_iterations, progress=batch_progress)
 
     # [batch_size, unrolled_iterations, symbol_count]
-    input_vector = build_input_vector(input_sequence, ngram_index_sequence, ngram_dataset)
+    input_vector = build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions)
 
     with tf.variable_scope("Cell", reuse=None):
       cell = make_cell(dropout=True)
@@ -255,7 +252,7 @@ class Train:
                                          sequence_length=consumed_sequence_lengths,
                                          initial_state=network_state)
 
-    total_loss, average_loss = get_loss(input_sequence, ngram_dataset, outputs, expected_sequence, consumed_sequence_lengths)
+    total_loss, average_loss = get_loss(input_sequence, ngram_predictions, outputs, expected_sequence, consumed_sequence_lengths)
 
     optimizer = tf.train.AdamOptimizer(args.learning_rate)
     tvars = tf.trainable_variables()
@@ -289,16 +286,16 @@ class Test:
   with tf.name_scope("Test"):
     indices = tf.range(train_test_divider, sequence_count)
     max_length = int(np.max(lengths[train_test_divider:]) + 2)
-    input_sequence, expected_sequence, ngram_index_sequence, ngram_sequence_list, consumed_sequence_lengths, finished_mask =\
+    input_sequence, expected_sequence, ngram_input_sequence, ngram_predictions, consumed_sequence_lengths, finished_mask =\
       build_batch(indices, max_length)
-    input_vector = build_input_vector(input_sequence, ngram_index_sequence, ngram_dataset)
+    input_vector = build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions)
     initial_state = make_state_tuple(tf.zeros([test_count, network_size]), False)
     with tf.variable_scope("Cell", reuse=True):
       cell = make_cell(dropout=False)
       outputs, _ = tf.nn.dynamic_rnn(cell, input_vector,
                                      sequence_length=consumed_sequence_lengths,
                                      initial_state=initial_state)
-    total_loss, average_loss = get_loss(input_sequence, ngram_dataset, outputs, expected_sequence, consumed_sequence_lengths)
+    total_loss, average_loss = get_loss(input_sequence, ngram_predictions, outputs, expected_sequence, consumed_sequence_lengths)
     summaries = tf.merge_summary([tf.scalar_summary('test_average_loss', average_loss)])
 
 init_op = tf.initialize_all_variables()
@@ -360,10 +357,11 @@ with tf.Session() as session:
   for v in tf.trainable_variables():
     print(v.name, v.get_shape())
 
+  steps = 201
   with status('Training...'):
-    for i in range(2001):
-      log("Training... {}/{}".format(i, 2000))
+    for i in range(steps):
+      log("Training... {}/{}".format(i + 1, steps))
       tf_run_jobs(session, train_job, train_summary_job)
       if i % 20 == 0:
-        tf_run_jobs(session, test_job, test_summary_job)
+        pass#tf_run_jobs(session, test_job, test_summary_job)
       flush_summaries()
