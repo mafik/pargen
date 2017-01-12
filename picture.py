@@ -14,7 +14,7 @@ buckets = 500
 
 run_logs = defaultdict(list)
 
-for path in glob('summaries/*/*.box'):
+for path in glob('summaries/*/*.mrogalski'):
   pickle_path = os.path.splitext(path)[0] + '.pickle'
   if (not os.path.exists(pickle_path)) or (os.path.getmtime(path) >= os.path.getmtime(pickle_path)):
     print("Reading events from", path)
@@ -57,14 +57,14 @@ high = defaultdict(list)
 
 keys = set()
 
-for type, run_log_list in run_logs:
-
-  for key, values in sorted(step.items()):
-    keys.add(key)
-    if values:
-      low[key].append(np.percentile(values, 50 - 34))
-      median[key].append(np.median(values))
-      high[key].append(np.percentile(values, 50 + 34))
+for type, run_log_list in run_logs.items():
+  print type
+  for run_log in run_log_list:
+    values, min, max = run_log['train_average_loss']
+    print values, min, max
+    keys.add(type)
+    for v in values:
+      median[type].append(v)
 
 def smooth(series_dict):
   for key, l1 in series_dict.items():
@@ -81,20 +81,20 @@ keys = list(sorted(keys, key=natural_keys))
 colors = 'red blue green brown black cyan magenta yellow'.split()
 plt.rc('font', family='Droid Serif', weight='light')
 plt.grid()
-for key, color in zip(keys, colors):
-  plt.fill_between(x[:len(low[key])], low[key], high[key], alpha=.3, linewidth=0, color=color)
 
 ceiling_tracker = []
 for key, color in zip(keys, colors):
   ceiling_tracker.extend(median[key])
+  print median[key]
   plt.plot(x[:len(median[key])], median[key], label=key, color=color)
 
 import math
 
 axes = plt.gca()
-axes.set_ylim([math.floor(np.min(ceiling_tracker) * 2) / 2, np.percentile(ceiling_tracker, 99.8)])
-
+#axes.set_ylim([math.floor(np.min(ceiling_tracker) * 2) / 2, np.percentile(ceiling_tracker, 99.8)])
+axes.set_ylim([0,2])
+axes.set_xlim([0, buckets])
 plt.legend(loc='upper right', fancybox=True, shadow=True)
 
-plt.savefig(args.ATTRIBUTE + '.png', dpi=200)
+plt.savefig('picture.png', dpi=200)
 #plt.plot()

@@ -18,6 +18,7 @@ from collections import Counter
 
 parser = argparse.ArgumentParser(description='Neural language model')
 parser.add_argument("-n", "--run-name", type=str, default=None)
+parser.add_argument("-g", "--generate", type=str, default=None)
 parser.add_argument("-a", "--learning-rate", type=float, default=0.01)
 parser.add_argument("-i", "--bootstrap-in", type=bool, default=False)
 parser.add_argument("-o", "--bootstrap-out", type=bool, default=False)
@@ -133,10 +134,10 @@ def translate1(array):
 def translate2(array):
   return '\n'.join(translate1(row) for row in array)
 
-batch_size = 40#0
+batch_size = 100
 check_indices = True
-unrolled_iterations = 30#0
-network_size = 200
+unrolled_iterations = 300
+network_size = 500
 layer_count = 2
 ngram_count = len(ngram_probability_table)
 
@@ -349,19 +350,93 @@ def test_job(average_loss):
   print()
   print("Test average loss:", average_loss)
 
+saver = tf.train.Saver()
+
 with tf.Session() as session:
   with status('Initializing...'):
     session.run(init_op)
 
-  print("Trainable variables:")
-  for v in tf.trainable_variables():
-    print(v.name, v.get_shape())
+  if args.generate:
+    saver.restore(session, "checkpoints/%s.ckpt" % (args.generate))
 
-  steps = 201
-  with status('Training...'):
-    for i in range(steps):
-      log("Training... {}/{}".format(i + 1, steps))
-      tf_run_jobs(session, train_job, train_summary_job)
-      if i % 20 == 0:
-        pass#tf_run_jobs(session, test_job, test_summary_job)
-      flush_summaries()
+
+    write("Generating sentences...")
+    args = {
+      self.sequence_lengths: np.ones((self.batch_size,), dtype=np.int32),
+      self.sequence: np.zeros((self.batch_size, self.max_sequence_length), dtype=np.int32)
+    }
+    results = []
+    beam = []
+    beam.append({
+      "sentence": "",
+      "entropy": 0,
+      "state": self.zero_state(),
+      "last_symbol": 1
+    })
+    beam_width = 100
+    branching = 10
+    iterations = 400 * beam_width
+    for i in range(iterations):
+      if i % 1000 == 0:
+        write("Generating sentences... (iteration {:,}/{:,})".format(i, iterations))
+      best = beam.pop()
+      args[self.sequence][0, 0] = best["last_symbol"]
+      for layer_placeholder, layer_state in zip(self.input_state, best["state"]):
+        for part_placeholder, part_state in zip(layer_placeholder, layer_state):
+          args[part_placeholder] = part_state
+      outputs = session.run([self.logits[0]] + list(chain(*self.state)), args)
+      generated_logits = outputs[0]
+      generated_state = list(chunks(outputs[1:], 2))
+      generated_distribution = np.exp(generated_logits[0, :])
+      generated_distribution /= np.sum(generated_distribution)
+
+      results.append({
+        "sentence": best["sentence"],
+        "entropy": (best["entropy"] - log(generated_distribution[0], 2)) / (len(best["sentence"]) + 1) # pow
+      })
+      results.sort(key=lambda x: -x["entropy"])
+      results = results[-10:]
+
+      for generated_arg in top_k(generated_distribution, branching):
+        next = {
+          "sentence": best["sentence"] + symbol_map[generated_arg],
+          "entropy": best["entropy"] - log(generated_distribution[generated_arg], 2),
+          "last_symbol": generated_arg,
+          "state": generated_state
+        }
+        beam.append(next)
+      if False:
+        maxlen = min(map(lambda x: len(x["sentence"]), beam))
+        beam.sort(key=lambda x: -x["entropy"] + (maxlen - len(x["sentence"])) * 0.1)
+      elif False:
+        beam.sort(key=lambda x: -x["entropy"] + (200 - len(x["sentence"])) * 0.1)
+      else:
+        beam.sort(key=lambda x: -x["entropy"])
+
+      if len(beam) > beam_width:
+        beam = beam[-beam_width:]
+    write("Generating sentences...")
+    print("DONE")
+    '''
+    print("Beam contents:")
+    for result in beam[-10:]:
+      print(u"{:.3f} : {}".format(result["entropy"] / (1+len(result['sentence'])), result["sentence"]))
+    #'''
+    print("Top complete sentences:")
+    for result in results:
+      print(u"{:.3f} : {}".format(result["entropy"], result["sentence"]))
+
+  else:
+    print("Trainable variables:")
+    for v in tf.trainable_variables():
+      print(v.name, v.get_shape())
+
+    steps = 501
+    with status('Training...'):
+      for i in range(steps):
+        log("Training... {}/{}".format(i + 1, steps))
+        tf_run_jobs(session, train_job, train_summary_job)
+        if (i + 1) % 50 == 0:
+          save_path = saver.save(session, "checkpoints/%s-%04d.ckpt" % (args.run_name, i))
+          tf_run_jobs(session, test_job, test_summary_job)
+        flush_summaries()
