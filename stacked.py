@@ -31,7 +31,7 @@ with status("Reading NKJP..."):
   arrays, lengths, symbol_map, symbol_count = data.read_nkjp_simple()
 
 dataset_np = np.concatenate([np.concatenate(([data.GO], arr, [data.EOS])) for arr in arrays])
-train_test_divider = int(len(lengths) * 0.8)
+train_test_divider = int(len(lengths) * 0.80)
 sequence_count = len(lengths)
 test_count = sequence_count - train_test_divider
 
@@ -133,9 +133,9 @@ def translate1(array):
 def translate2(array):
   return '\n'.join(translate1(row) for row in array)
 
-batch_size = 40#0
-check_indices = True
-unrolled_iterations = 30#0
+batch_size = 400
+check_indices = False
+unrolled_iterations = 300
 network_size = 200
 layer_count = 2
 ngram_count = len(ngram_probability_table)
@@ -157,6 +157,14 @@ ngram_embedding_size = 10
 ngram_embeddings = tf.Variable(tf.random_normal([ngram_count, ngram_embedding_size], mean=0.0, stddev=0.02),
                                trainable=True, name="ngram_embeddings")
 
+
+cudnn_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, network_size, dropout=0)
+cudnn_train_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, network_size, dropout=0.5)
+cudnn_param_size = cudnn_cell.params_size()
+cudnn_params = tf.Variable(tf.random_normal([cudnn_param_size], mean=0.0, stddev=0.02),
+                               trainable=False, name="cudnn_params")
+
+
 def make_cell(dropout):
   cell = LSTMCell(network_size, use_peepholes=True, cell_clip=10, state_is_tuple=True)
   if dropout:
@@ -177,14 +185,16 @@ def build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions):
   return input_list[0] if len(input_list) == 1 else tf.concat(2, input_list)
 
 
-def get_loss(input_sequence, ngram_predictions, outputs, expected_sequence, consumed_sequence_lengths):
+def get_total_loss(input_sequence, ngram_predictions, outputs, expected_sequence):
   if args.bootstrap_out:
     outputs = tf.add(outputs, tf.log(ngram_predictions))
   # [batch_size, unrolled_iterations]
   losses = tf.nn.sparse_softmax_cross_entropy_with_logits(outputs, expected_sequence)
   losses = tf.select(tf.equal(input_sequence, data.EOS), tf.zeros_like(losses), losses)
-  total_loss = tf.reduce_sum(losses)
-  return total_loss, total_loss / tf.cast(tf.reduce_sum(consumed_sequence_lengths), dtype=tf.float32)
+  return tf.reduce_sum(losses)
+
+def get_average_loss(total_loss, consumed_sequence_lengths):
+  return total_loss / tf.cast(tf.reduce_sum(consumed_sequence_lengths), dtype=tf.float32)
 
 def build_batch(indices, length, progress=None):
   if progress == None:
@@ -252,7 +262,8 @@ class Train:
                                          sequence_length=consumed_sequence_lengths,
                                          initial_state=network_state)
 
-    total_loss, average_loss = get_loss(input_sequence, ngram_predictions, outputs, expected_sequence, consumed_sequence_lengths)
+    total_loss = get_total_loss(input_sequence, ngram_predictions, outputs, expected_sequence)
+    average_loss = get_average_loss(total_loss, consumed_sequence_lengths)
 
     optimizer = tf.train.AdamOptimizer(args.learning_rate)
     tvars = tf.trainable_variables()
@@ -263,7 +274,7 @@ class Train:
     # [batch_size] : int32
     final_batch_progress = tf.add(batch_progress, consumed_sequence_lengths, name="final_batch_progress")
 
-    with tf.control_dependencies([apply_gradients]):
+    with tf.control_dependencies([apply_gradients, final_batch_progress]):
       copy_network_state_ops = []
       for layer_var, layer_new in zip(network_state, state):
         for state_part_var, state_part_new in zip(layer_var, layer_new):
@@ -284,22 +295,29 @@ class Train:
 
 class Test:
   with tf.name_scope("Test"):
-    indices = tf.range(train_test_divider, sequence_count)
-    max_length = int(np.max(lengths[train_test_divider:]) + 2)
-    input_sequence, expected_sequence, ngram_input_sequence, ngram_predictions, consumed_sequence_lengths, finished_mask =\
-      build_batch(indices, max_length)
-    input_vector = build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions)
-    initial_state = make_state_tuple(tf.zeros([test_count, network_size]), False)
-    with tf.variable_scope("Cell", reuse=True):
-      cell = make_cell(dropout=False)
-      outputs, _ = tf.nn.dynamic_rnn(cell, input_vector,
-                                     sequence_length=consumed_sequence_lengths,
-                                     initial_state=initial_state)
-    total_loss, average_loss = get_loss(input_sequence, ngram_predictions, outputs, expected_sequence, consumed_sequence_lengths)
-    summaries = tf.merge_summary([tf.scalar_summary('test_average_loss', average_loss)])
+    LOOPS = 4
+    losses = []
+    for i in range(LOOPS):
+      a = train_test_divider + test_count * i / LOOPS
+      b = train_test_divider + test_count * (i+1) / LOOPS
+      indices = tf.range(a, b)
+      max_length = int(np.max(lengths[a:b])) + 2
+      #max_length = min(max_length, 400) # TODO: test of full test set :(
+      input_sequence, expected_sequence, ngram_input_sequence, ngram_predictions, consumed_sequence_lengths, finished_mask =\
+        build_batch(indices, max_length)
+      input_vector = build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions)
+      initial_state = make_state_tuple(tf.zeros([b-a, network_size]), False)
+      with tf.variable_scope("Cell", reuse=True):
+        cell = make_cell(dropout=False)
+        outputs, _ = tf.nn.dynamic_rnn(cell, input_vector,
+                                       sequence_length=consumed_sequence_lengths,
+                                       initial_state=initial_state)
+      average_loss = get_average_loss(get_total_loss(input_sequence, ngram_predictions, outputs, expected_sequence), consumed_sequence_lengths)
+      losses.append(average_loss)
+
+    summaries = tf.merge_summary([tf.scalar_summary('test_average_loss', tf.add_n(losses) / LOOPS)])
 
 init_op = tf.initialize_all_variables()
-
 
 request = []
 
@@ -346,22 +364,27 @@ def train_job(_):
 
 @tf_job(Test.average_loss)
 def test_job(average_loss):
-  print()
-  print("Test average loss:", average_loss)
+  pass
+  #print("\nTest average loss:", average_loss)
 
-with tf.Session() as session:
+
+config = tf.ConfigProto()
+#config.log_device_placement = True
+#config.gpu_options.per_process_gpu_memory_fraction = 1.0
+with tf.Session(config=config) as session:
+
   with status('Initializing...'):
     session.run(init_op)
 
-  print("Trainable variables:")
-  for v in tf.trainable_variables():
-    print(v.name, v.get_shape())
+  #print("Trainable variables:")
+  #for v in tf.trainable_variables():
+  #  print(v.name, v.get_shape())
 
-  steps = 201
+  steps = 2001
   with status('Training...'):
     for i in range(steps):
       log("Training... {}/{}".format(i + 1, steps))
       tf_run_jobs(session, train_job, train_summary_job)
       if i % 20 == 0:
-        pass#tf_run_jobs(session, test_job, test_summary_job)
+        tf_run_jobs(session, test_job, test_summary_job)
       flush_summaries()
