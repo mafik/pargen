@@ -92,6 +92,7 @@ def read_nkjp_simple():
 
 def read_nkjp(ngram_length=1):
   cache_path = "data-nkjp/cache-{}-gram.npz".format(ngram_length)
+  texts = []
   try:
     npzfile = np.load(cache_path)
     arrays = npzfile['arrays']
@@ -101,8 +102,6 @@ def read_nkjp(ngram_length=1):
   except IOError as e:
     parser = xml.sax.make_parser()
     parser.setFeature(xml.sax.handler.feature_namespaces, 0)
-
-    texts = []
 
     class NkjpHandler( xml.sax.ContentHandler ):
       def __init__(self):
@@ -165,6 +164,9 @@ def read_nkjp(ngram_length=1):
 
   train_cut = len(arrays) * 8 / 10
   valid_cut = len(arrays) * 9 / 10
+
+  #for t in texts[valid_cut:]:
+  #  print(t)
   train_set = Obj(arrays=arrays[:train_cut], lengths=lengths[:train_cut], size=train_cut)
   valid_set = Obj(arrays=arrays[train_cut:valid_cut], lengths=lengths[train_cut:valid_cut], size=valid_cut-train_cut)
   test_set = Obj(arrays=arrays[valid_cut:], lengths=lengths[valid_cut:], size=len(arrays) - valid_cut)
