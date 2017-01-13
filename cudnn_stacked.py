@@ -4,13 +4,13 @@
 from __future__ import print_function
 
 from itertools import chain
+from libxml2mod import last
 
 import data, datetime, argparse, sys
 
 import numpy as np
 import tensorflow as tf
 
-from tensorflow.python.ops.rnn_cell import *
 from utils import *
 from kneser_ney import KneserNeyLM
 from nltk.util import ngrams as ngram_generator
@@ -18,11 +18,9 @@ from collections import Counter
 
 parser = argparse.ArgumentParser(description='Neural language model')
 parser.add_argument("-n", "--run-name", type=str, default=None)
-parser.add_argument("-g", "--generate", type=str, default=None)
 parser.add_argument("-a", "--learning-rate", type=float, default=0.01)
-parser.add_argument("-i", "--bootstrap-in", type=bool, default=False)
-parser.add_argument("-o", "--bootstrap-out", type=bool, default=False)
-parser.add_argument("-m", "--bootstrap-mem", type=bool, default=False)
+parser.add_argument("-l", "--layer-count", type=int, default=2)
+parser.add_argument("-s", "--network-size", type=int, default=200)
 args = parser.parse_args()
 
 if args.run_name == 'date':
@@ -134,11 +132,9 @@ def translate1(array):
 def translate2(array):
   return '\n'.join(translate1(row) for row in array)
 
-batch_size = 100
-check_indices = True
-unrolled_iterations = 300
-network_size = 500
-layer_count = 2
+check_indices = False
+network_size = args.network_size
+layer_count = args.layer_count
 ngram_count = len(ngram_probability_table)
 
 # [sum(len(a) + 2 for a in arrays)] : int32
@@ -159,40 +155,41 @@ ngram_embeddings = tf.Variable(tf.random_normal([ngram_count, ngram_embedding_si
                                trainable=True, name="ngram_embeddings")
 
 
-cudnn_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, network_size, dropout=0)
-cudnn_train_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, network_size, dropout=0.5)
-cudnn_param_size = cudnn_cell.params_size()
-print("Params:", cudnn_param_size)
-cudnn_params = tf.Variable(tf.random_normal([cudnn_param_size], mean=0.0, stddev=0.02),
-                               trainable=False, name="cudnn_params")
+input_vector_size = symbol_count
 
+config = tf.ConfigProto()
+#config.gpu_options.allow_growth = True
+#config.gpu_options.per_process_gpu_memory_fraction = 0.3
 
-def make_cell(dropout):
-  cell = LSTMCell(network_size, use_peepholes=True, cell_clip=10, state_is_tuple=True)
-  if dropout:
-    cell = DropoutWrapper(cell, output_keep_prob=.5)
-  cell = MultiRNNCell([cell] * layer_count, state_is_tuple=True)
-  cell = InputProjectionWrapper(cell, num_proj=network_size)
-  cell = OutputProjectionWrapper(cell, output_size=symbol_count)
-  return cell
+with tf.device('/gpu:0'):
+  cudnn_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, input_vector_size, dropout=0)
+  cudnn_train_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, input_vector_size, dropout=0.5)
+
+  config.graph_options.optimizer_options.opt_level = -1
+  with tf.Session(config=config) as session:
+    cudnn_param_size = cudnn_cell.params_size().eval()
+  config.graph_options.optimizer_options.opt_level = 0
+  cudnn_params = tf.Variable(tf.random_normal([cudnn_param_size], mean=0.0, stddev=0.005), validate_shape=False, name="cudnn_params")
+
+params_saveable = tf.contrib.cudnn_rnn.RNNParamsSaveable(
+  cudnn_cell.params_to_canonical,
+  cudnn_cell.canonical_to_params,
+  cudnn_params)
+tf.add_to_collection(tf.GraphKeys.SAVEABLE_OBJECTS, params_saveable)
+saver = tf.train.Saver(write_version=tf.train.SaverDef.V2)
+
+output_projection_w = tf.Variable(tf.random_normal([network_size, symbol_count]), name="output_projection_w")
+output_projection_b = tf.Variable(tf.random_normal([symbol_count]), name="output_projection_b")
 
 def build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions):
-  input_list = []
-  input_list.append(tf.one_hot(input_sequence, symbol_count))
-  if args.bootstrap_in:
-    mean, variance = tf.nn.moments(ngram_predictions, [2], keep_dims=True)
-    input_list.append(tf.nn.batch_normalization(ngram_predictions, mean, variance, 0, 1, 0.00001))
-  if args.bootstrap_mem:
-    input_list.append(tf.gather(ngram_embeddings, tf.squeeze(tf.slice(ngram_input_sequence, [0,0,3], [-1,-1,1]))))
-  return input_list[0] if len(input_list) == 1 else tf.concat(2, input_list)
+  return tf.one_hot(input_sequence, symbol_count)
 
 
 def get_total_loss(input_sequence, ngram_predictions, outputs, expected_sequence):
-  if args.bootstrap_out:
-    outputs = tf.add(outputs, tf.log(ngram_predictions))
+  outputs = tf.add(outputs, tf.log(ngram_predictions))
   # [batch_size, unrolled_iterations]
-  losses = tf.nn.sparse_softmax_cross_entropy_with_logits(outputs, expected_sequence)
-  losses = tf.select(tf.equal(input_sequence, data.EOS), tf.zeros_like(losses), losses)
+  losses = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=outputs, labels=expected_sequence)
+  losses = tf.where(tf.equal(input_sequence, data.EOS), tf.zeros_like(losses), losses)
   return tf.reduce_sum(losses)
 
 def get_average_loss(total_loss, consumed_sequence_lengths):
@@ -206,37 +203,30 @@ def build_batch(indices, length, progress=None):
   current_offsets = tf.add(start_offsets, progress, name="current_offsets")
   remaining_lengths = tf.sub(lengths, progress, name="remaining_lengths")
   max_range = tf.sub(remaining_lengths, 1)
-  range_matrix = tf.minimum(*tf.meshgrid(max_range, tf.range(length + 1), indexing='ij'), name="range_matrix")
-  indices_to_gather = tf.add(tf.tile(tf.expand_dims(current_offsets, 1), [1, length + 1]),
+
+  range_matrix = tf.minimum(*tf.meshgrid(tf.range(length + 1), max_range, indexing='ij'), name="range_matrix")
+  indices_to_gather = tf.add(tf.tile(tf.expand_dims(current_offsets, 0), [length + 1, 1]),
                              range_matrix, name='indices_to_gather')
   sequence = tf.gather(dataset, indices_to_gather, check_indices, name="sequence")
-  ngram_input_sequence = tf.gather(ngram_dataset, tf.slice(indices_to_gather, [0, 0], [-1, length]),
+  ngram_input_sequence = tf.gather(ngram_dataset, indices_to_gather[:-1],
                                    check_indices, name="ngram_input_sequence")
-  ngram_predictions = tf.gather(ngram_probability_table, tf.squeeze(tf.slice(ngram_input_sequence, [0, 0, 3], [-1, -1, 1]), [2]), check_indices)
+  ngram_predictions = tf.gather(ngram_probability_table, ngram_input_sequence[:,:,3], check_indices)
   # [batch_size] : int32
   # NOTE: batch_max_range is used instead of remaining_batch_lengths to prevent passing of the final EOS as the input
   consumed_sequence_lengths = tf.minimum(max_range, length, name="consumed_sequence_lengths")
   # [batch_size] : bool
   finished_batch_mask = tf.greater_equal(consumed_sequence_lengths, max_range, name="finished_batch_mask")
-  input_sequence = tf.slice(sequence, [0, 0], [-1, length])
-  expected_sequence = tf.slice(sequence, [0, 1], [-1, length])
+  input_sequence = sequence[:-1]
+  expected_sequence = sequence[1:]
   return input_sequence, expected_sequence, ngram_input_sequence, ngram_predictions, consumed_sequence_lengths, finished_batch_mask
-
-def make_state_tuple(zero_state, variable):
-  if variable:
-    return tuple(LSTMStateTuple(*[tf.Variable(zero_state, trainable=False, name="network_state_{}_{}".format(part, layer))
-                     for part in "ch"]) for layer in range(layer_count))
-  else:
-    return tuple(LSTMStateTuple(*[zero_state for part in "ch"]) for layer in range(layer_count))
 
 class Train:
   with tf.name_scope('Train'):
-
-    # [batch_size, network_size] : float32
-    initial_zero_state = tf.zeros([batch_size, network_size], name="initial_zero_state")
-
-    # tuple2(tuple2([batch_size, network_size])) : float32
-    network_state = make_state_tuple(initial_zero_state, True)
+    batch_size = 200
+    unrolled_iterations = 600
+    initial_state = tf.zeros([layer_count * 1, batch_size, network_size])
+    network_state_h = tf.Variable(initial_state, trainable=False, name="network_state_h")
+    network_state_c = tf.Variable(initial_state, trainable=False, name="network_state_c")
 
     global_step = tf.Variable(1, dtype=tf.int32, trainable=False, name='global_step')
 
@@ -255,22 +245,26 @@ class Train:
     input_sequence, expected_sequence, ngram_input_sequence, ngram_predictions, consumed_sequence_lengths, finished_batch_mask =\
       build_batch(batch_indices, unrolled_iterations, progress=batch_progress)
 
-    # [batch_size, unrolled_iterations, symbol_count]
+    # [unrolled_iterations, batch_size, symbol_count]
     input_vector = build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions)
 
     with tf.variable_scope("Cell", reuse=None):
-      cell = make_cell(dropout=True)
-      outputs, state = tf.nn.dynamic_rnn(cell, input_vector,
-                                         sequence_length=consumed_sequence_lengths,
-                                         initial_state=network_state)
+      outputs, output_h, output_c = cudnn_train_cell(input_vector, network_state_h, network_state_c, cudnn_params)
+
+    tiled_projection_matrix = tf.tile(tf.expand_dims(output_projection_w, 0), [unrolled_iterations, 1, 1])
+    outputs = tf.matmul(outputs, tiled_projection_matrix) + output_projection_b
 
     total_loss = get_total_loss(input_sequence, ngram_predictions, outputs, expected_sequence)
     average_loss = get_average_loss(total_loss, consumed_sequence_lengths)
 
     optimizer = tf.train.AdamOptimizer(args.learning_rate)
     tvars = tf.trainable_variables()
+    cudnn_params.get_shape().as_list = lambda: [cudnn_param_size]
+
+    #gradients = tf.gradients([total_loss], [cudnn_params])
+    #apply_gradients = optimizer.apply_gradients([(gradients[0], cudnn_params)], global_step=global_step)
+
     gradients_with_vars = optimizer.compute_gradients(total_loss, var_list=tvars)
-    #global_norm = tf.global_norm([gv[0] for gv in gradients_with_vars])
     apply_gradients = optimizer.apply_gradients(gradients_with_vars, global_step=global_step)
 
     # [batch_size] : int32
@@ -278,48 +272,44 @@ class Train:
 
     with tf.control_dependencies([apply_gradients, final_batch_progress]):
       copy_network_state_ops = []
-      for layer_var, layer_new in zip(network_state, state):
-        for state_part_var, state_part_new in zip(layer_var, layer_new):
-          op = tf.assign(state_part_var, tf.select(finished_batch_mask, initial_zero_state, state_part_var))
-          copy_network_state_ops.append(op)
+      expanded_finished_batch_mask = tf.tile(tf.reshape(finished_batch_mask, [1, batch_size, 1]), [layer_count, 1, network_size])
+      for state, out in zip([network_state_c, network_state_h], [output_c, output_h]):
+        op = tf.assign(state, tf.where(expanded_finished_batch_mask, initial_state, out))
+        copy_network_state_ops.append(op)
       copy_network_state_op = tf.group(*copy_network_state_ops, name="copy_network_state_op")
 
-      advance_batch_indices_op = tf.assign(batch_indices, tf.select(finished_batch_mask, random_batch_indices, batch_indices), name="advance_batch_indices_op")
-      advance_batch_progress_op = tf.assign(batch_progress, tf.select(finished_batch_mask, zero_batch, final_batch_progress), name="advance_batch_progress_op")
+      advance_batch_indices_op = tf.assign(batch_indices, tf.where(finished_batch_mask, random_batch_indices, batch_indices), name="advance_batch_indices_op")
+      advance_batch_progress_op = tf.assign(batch_progress, tf.where(finished_batch_mask, zero_batch, final_batch_progress), name="advance_batch_progress_op")
       advance_batch_op = tf.group(advance_batch_indices_op, advance_batch_progress_op, name="advance_batch_op")
 
     train_op = tf.group(apply_gradients, advance_batch_op, copy_network_state_op)
 
     summary_list = []
-    summary_list.append(tf.scalar_summary('train_average_loss', average_loss))
-    #train_summary_list.append(tf.scalar_summary('global_norm', global_norm))
-    summaries = tf.merge_summary(summary_list)
+    summary_list.append(tf.summary.scalar('average_loss', average_loss))
+    #train_summary_list.append(tf.summary.scalar('global_norm', global_norm))
+    summaries = tf.summary.merge(summary_list)
 
 class Test:
   with tf.name_scope("Test"):
-    LOOPS = 4
+    LOOPS = 6
     losses = []
     for i in range(LOOPS):
       a = train_test_divider + test_count * i / LOOPS
       b = train_test_divider + test_count * (i+1) / LOOPS
       indices = tf.range(a, b)
       max_length = int(np.max(lengths[a:b])) + 2
-      #max_length = min(max_length, 400) # TODO: test of full test set :(
       input_sequence, expected_sequence, ngram_input_sequence, ngram_predictions, consumed_sequence_lengths, finished_mask =\
         build_batch(indices, max_length)
       input_vector = build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions)
-      initial_state = make_state_tuple(tf.zeros([b-a, network_size]), False)
+      initial_state = tf.zeros([layer_count * 1, b-a, network_size])
       with tf.variable_scope("Cell", reuse=True):
-        cell = make_cell(dropout=False)
-        outputs, _ = tf.nn.dynamic_rnn(cell, input_vector,
-                                       sequence_length=consumed_sequence_lengths,
-                                       initial_state=initial_state)
+        outputs, output_h, output_c = cudnn_cell(input_vector, initial_state, initial_state, cudnn_params, is_training=False)
+      tiled_projection_matrix = tf.tile(tf.expand_dims(output_projection_w, 0), [max_length, 1, 1])
+      outputs = tf.matmul(outputs, tiled_projection_matrix) + output_projection_b
       average_loss = get_average_loss(get_total_loss(input_sequence, ngram_predictions, outputs, expected_sequence), consumed_sequence_lengths)
       losses.append(average_loss)
 
-    summaries = tf.merge_summary([tf.scalar_summary('test_average_loss', tf.add_n(losses) / LOOPS)])
-
-init_op = tf.initialize_all_variables()
+    summaries = tf.summary.merge([tf.summary.scalar('average_loss', tf.add_n(losses) / LOOPS)])
 
 request = []
 
@@ -340,128 +330,61 @@ def tf_run_jobs(session, *jobs):
     slices.append((a,b,job))
   result = session.run(request)
   for a, b, job in slices:
-    job(*result[a:b])
+    job(session, *result[a:b])
 
 test_summary_job = lambda: None
 train_summary_job = lambda: None
 flush_summaries = lambda: None
+best_test_loss = 10000
+last_test_loss = 0
+train_loss = 0
 if args.run_name:
   summary_dir = "summaries/" + args.run_name
   if os.path.exists(summary_dir):
-    summary_writer = tf.train.SummaryWriter(summary_dir)
+    summary_writer = tf.summary.FileWriter(summary_dir)
   else:
-    summary_writer = tf.train.SummaryWriter(summary_dir, tf.get_default_graph())
+    summary_writer = tf.summary.FileWriter(summary_dir, tf.get_default_graph())
   @tf_job(Train.summaries, Train.global_step)
-  def train_summary_job(summary, step):
+  def train_summary_job(session, summary, step):
     summary_writer.add_summary(summary, step)
   @tf_job(Test.summaries, Train.global_step)
-  def test_summary_job(summary, step):
+  def test_summary_job(session, summary, step):
     summary_writer.add_summary(summary, step)
   def flush_summaries():
     summary_writer.flush()
 
-@tf_job(Train.train_op)
-def train_job(_):
-  pass
+@tf_job(Train.train_op, Train.average_loss)
+def train_job(session, _, average_loss):
+  global train_loss
+  train_loss = average_loss
 
 @tf_job(Test.average_loss)
-def test_job(average_loss):
-  pass
+def test_job(session, average_loss):
+  global best_test_loss, last_test_loss
+  last_test_loss = average_loss
+  if average_loss < best_test_loss:
+    best_test_loss = average_loss
+    if args.run_name:
+      saver.save(session, os.path.join(summary_dir, "best_params"))
+      open(os.path.join(summary_dir, "best_params_loss.txt"), 'w').write(str(average_loss))
   #print("\nTest average loss:", average_loss)
 
 
-config = tf.ConfigProto()
-#config.log_device_placement = True
-#config.gpu_options.per_process_gpu_memory_fraction = 1.0
+if __name__ == "__main__":
+  with tf.Session(config=config) as session:
 
+    with status('Initializing...'):
+      session.run(tf.global_variables_initializer())
+    #print("Trainable variables:")
+    #for v in tf.trainable_variables():
+    #  print(v.name, v.get_shape())
 
-saver = tf.train.Saver()
-
-with tf.Session(config=config) as session:
-  with status('Initializing...'):
-    session.run(init_op)
-
-  if args.generate:
-    saver.restore(session, "checkpoints/%s.ckpt" % (args.generate))
-
-
-    write("Generating sentences...")
-    args = {
-      self.sequence_lengths: np.ones((self.batch_size,), dtype=np.int32),
-      self.sequence: np.zeros((self.batch_size, self.max_sequence_length), dtype=np.int32)
-    }
-    results = []
-    beam = []
-    beam.append({
-      "sentence": "",
-      "entropy": 0,
-      "state": self.zero_state(),
-      "last_symbol": 1
-    })
-    beam_width = 100
-    branching = 10
-    iterations = 400 * beam_width
-    for i in range(iterations):
-      if i % 1000 == 0:
-        write("Generating sentences... (iteration {:,}/{:,})".format(i, iterations))
-      best = beam.pop()
-      args[self.sequence][0, 0] = best["last_symbol"]
-      for layer_placeholder, layer_state in zip(self.input_state, best["state"]):
-        for part_placeholder, part_state in zip(layer_placeholder, layer_state):
-          args[part_placeholder] = part_state
-      outputs = session.run([self.logits[0]] + list(chain(*self.state)), args)
-      generated_logits = outputs[0]
-      generated_state = list(chunks(outputs[1:], 2))
-      generated_distribution = np.exp(generated_logits[0, :])
-      generated_distribution /= np.sum(generated_distribution)
-
-      results.append({
-        "sentence": best["sentence"],
-        "entropy": (best["entropy"] - log(generated_distribution[0], 2)) / (len(best["sentence"]) + 1) # pow
-      })
-      results.sort(key=lambda x: -x["entropy"])
-      results = results[-10:]
-
-      for generated_arg in top_k(generated_distribution, branching):
-        next = {
-          "sentence": best["sentence"] + symbol_map[generated_arg],
-          "entropy": best["entropy"] - log(generated_distribution[generated_arg], 2),
-          "last_symbol": generated_arg,
-          "state": generated_state
-        }
-        beam.append(next)
-      if False:
-        maxlen = min(map(lambda x: len(x["sentence"]), beam))
-        beam.sort(key=lambda x: -x["entropy"] + (maxlen - len(x["sentence"])) * 0.1)
-      elif False:
-        beam.sort(key=lambda x: -x["entropy"] + (200 - len(x["sentence"])) * 0.1)
-      else:
-        beam.sort(key=lambda x: -x["entropy"])
-
-      if len(beam) > beam_width:
-        beam = beam[-beam_width:]
-    write("Generating sentences...")
-    print("DONE")
-    '''
-    print("Beam contents:")
-    for result in beam[-10:]:
-      print(u"{:.3f} : {}".format(result["entropy"] / (1+len(result['sentence'])), result["sentence"]))
-    #'''
-    print("Top complete sentences:")
-    for result in results:
-      print(u"{:.3f} : {}".format(result["entropy"], result["sentence"]))
-
-  else:
-    print("Trainable variables:")
-    for v in tf.trainable_variables():
-      print(v.name, v.get_shape())
-
-    steps = 501
+    steps = 6000
+    test_every_n_steps = 50
     with status('Training...'):
       for i in range(steps):
-        log("Training... {}/{}".format(i + 1, steps))
+        log("Training... {}/{}, train loss: {:.3f}, test loss: best {:.3f}, last {:.3f}".format(i + 1, steps, train_loss, best_test_loss, last_test_loss))
         tf_run_jobs(session, train_job, train_summary_job)
-        if (i + 1) % 50 == 0:
-          save_path = saver.save(session, "checkpoints/%s-%04d.ckpt" % (args.run_name, i))
+        if i % test_every_n_steps == test_every_n_steps - 1:
           tf_run_jobs(session, test_job, test_summary_job)
         flush_summaries()

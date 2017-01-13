@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 
 from __future__ import print_function
@@ -34,11 +34,11 @@ print("DONE")
 
 # Training parameters
 
-restore = True
-train_time = 0 # float("inf") # 600
+restore = False
+train_time = float("inf") # 600
 checkpoint_time = 600
-test = False
-gen = True
+test = True
+gen = False
 checkpoint_entropy = 999999
 
 saver = None
