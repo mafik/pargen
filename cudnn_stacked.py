@@ -21,13 +21,14 @@ parser.add_argument("-n", "--run-name", type=str, default=None)
 parser.add_argument("-a", "--learning-rate", type=float, default=0.01)
 parser.add_argument("-l", "--layer-count", type=int, default=2)
 parser.add_argument("-s", "--network-size", type=int, default=200)
+parser.add_argument("-d", "--dropout", type=float, default=0.5)
 args = parser.parse_args()
 
 if args.run_name == 'date':
   args.run_name = datetime.datetime.now().strftime("%A %H%M")
 
 with status("Reading NKJP..."):
-  arrays, lengths, symbol_map, symbol_count = data.read_nkjp_simple()
+  arrays, lengths, symbol_map, reverse_symbol_map, symbol_count = data.read_nkjp_simple()
 
 dataset_np = np.concatenate([np.concatenate(([data.GO], arr, [data.EOS])) for arr in arrays])
 train_test_divider = int(len(lengths) * 0.80)
@@ -163,7 +164,12 @@ config = tf.ConfigProto()
 
 with tf.device('/gpu:0'):
   cudnn_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, input_vector_size, dropout=0)
-  cudnn_train_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, input_vector_size, dropout=0.5)
+  if args.dropout:
+    print('A')
+    cudnn_train_cell = tf.contrib.cudnn_rnn.CudnnLSTM(layer_count, network_size, input_vector_size, dropout=args.dropout)
+  else:
+    print('B')
+    cudnn_train_cell = cudnn_cell
 
   config.graph_options.optimizer_options.opt_level = -1
   with tf.Session(config=config) as session:
@@ -176,10 +182,11 @@ params_saveable = tf.contrib.cudnn_rnn.RNNParamsSaveable(
   cudnn_cell.canonical_to_params,
   cudnn_params)
 tf.add_to_collection(tf.GraphKeys.SAVEABLE_OBJECTS, params_saveable)
-saver = tf.train.Saver(write_version=tf.train.SaverDef.V2)
 
 output_projection_w = tf.Variable(tf.random_normal([network_size, symbol_count]), name="output_projection_w")
 output_projection_b = tf.Variable(tf.random_normal([symbol_count]), name="output_projection_b")
+
+saver = tf.train.Saver(write_version=tf.train.SaverDef.V2)
 
 def build_input_vector(input_sequence, ngram_input_sequence, ngram_predictions):
   return tf.one_hot(input_sequence, symbol_count)
@@ -366,7 +373,7 @@ def test_job(session, average_loss):
     best_test_loss = average_loss
     if args.run_name:
       saver.save(session, os.path.join(summary_dir, "best_params"))
-      open(os.path.join(summary_dir, "best_params_loss.txt"), 'w').write(str(average_loss))
+      open(os.path.join(summary_dir, "best_params_loss.txt"), 'w').write(str(average_loss) + '\n')
   #print("\nTest average loss:", average_loss)
 
 

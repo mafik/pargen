@@ -3,6 +3,7 @@ from __future__ import print_function
 
 import itertools
 
+from collections import Counter, defaultdict
 from utils import *
 from glob import glob
 import random, xml.sax
@@ -32,6 +33,14 @@ GO = 1
 UNK = 2
 _symbol_map_prefix = ['<EOS>', '<GO>', '<UNK>']
 
+def make_reverse_symbol_map(symbol_map):
+  def constant_factory(value):
+    return itertools.repeat(value).next
+  reverse_symbol_map = defaultdict(constant_factory(UNK))
+  for i, symbol in enumerate(symbol_map):
+    reverse_symbol_map[symbol] = i
+  return reverse_symbol_map
+
 def read_nkjp_simple():
   cache_path = "data-nkjp/cache.npz"
   try:
@@ -40,6 +49,7 @@ def read_nkjp_simple():
     lengths = npzfile['lengths']
     symbol_map = npzfile['symbol_map']
     symbol_count = npzfile['symbol_count']
+    reverse_symbol_map = make_reverse_symbol_map(symbol_map)
   except IOError as e:
     parser = xml.sax.make_parser()
     parser.setFeature(xml.sax.handler.feature_namespaces, 0)
@@ -73,22 +83,17 @@ def read_nkjp_simple():
     rand = random.Random(1337)
     random.shuffle(texts, random=lambda: rand.uniform(0,1))
 
-    from collections import Counter, defaultdict
     symbol_counter = Counter()
     for text in texts:
       symbol_counter.update(text)
     symbol_map = np.array(_symbol_map_prefix + [symbol for symbol, count in symbol_counter.items() if count >= 5])
-    def constant_factory(value):
-      return itertools.repeat(value).next
-    reverse_symbol_map = defaultdict(constant_factory(UNK))
-    for i, symbol in enumerate(symbol_map):
-      reverse_symbol_map[symbol] = i
+    reverse_symbol_map = make_reverse_symbol_map(symbol_map)
 
     lengths = np.array([len(text) for text in texts], dtype=np.int32)
     arrays = np.array([np.array([reverse_symbol_map[c] for c in text], dtype=np.int32) for text in texts])
     symbol_count = len(symbol_map)
     np.savez(cache_path, arrays=arrays, lengths=lengths, symbol_map=symbol_map, symbol_count=symbol_count)
-  return arrays, lengths, symbol_map, symbol_count
+  return arrays, lengths, symbol_map, reverse_symbol_map, symbol_count
 
 def read_nkjp(ngram_length=1):
   cache_path = "data-nkjp/cache-{}-gram.npz".format(ngram_length)
@@ -172,5 +177,4 @@ def read_nkjp(ngram_length=1):
   test_set = Obj(arrays=arrays[valid_cut:], lengths=lengths[valid_cut:], size=len(arrays) - valid_cut)
   return train_set, valid_set, test_set, symbol_map, symbol_count
 
-if __name__ == "__main__":
-  read_nkjp()
+arrays, lengths, symbol_map, reverse_symbol_map, symbol_count = read_nkjp_simple()
